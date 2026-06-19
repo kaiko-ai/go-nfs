@@ -35,13 +35,22 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		attrs = sattr
 	} else if how == createModeExclusive {
 		// read createverf3
+		//
+		// EXCLUSIVE create is implemented with GUARDED (create-if-absent)
+		// semantics: the atomic O_EXCL open below fails with NFS3ERR_EXIST if
+		// the target already exists. This satisfies POSIX O_CREAT|O_EXCL and the
+		// Rust object_store `create_new` path (delta-rs staging writes). The
+		// createverf3 verifier — which would make the create idempotent across
+		// RPC retransmissions — is read off the wire but not persisted; verifier
+		// based at-most-once semantics can be layered on later.
 		var verf [8]byte
 		if err := xdr.Read(w.req.Body, &verf); err != nil {
 			return &NFSStatusError{NFSStatusInval, err}
 		}
-		Log.Errorf("failing create to indicate lack of support for 'exclusive' mode.")
-		// TODO: support 'exclusive' mode.
-		return &NFSStatusError{NFSStatusNotSupp, os.ErrPermission}
+		// Nothing to apply: the client follows an exclusive create with a
+		// separate SETATTR. A non-nil value avoids a nil dereference in the
+		// attrs.Apply call below.
+		attrs = &SetFileAttributes{}
 	} else {
 		// invalid
 		return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
@@ -65,7 +74,7 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		if s.IsDir() {
 			return &NFSStatusError{NFSStatusExist, nil}
 		}
-		if how == createModeGuarded {
+		if how == createModeGuarded || how == createModeExclusive {
 			return &NFSStatusError{NFSStatusExist, os.ErrPermission}
 		}
 	} else {
@@ -76,7 +85,19 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		}
 	}
 
-	file, err := fs.Create(newFilePath)
+	// For EXCLUSIVE create, open with O_EXCL so the filesystem enforces
+	// create-if-absent atomically and returns NFS3ERR_EXIST on a racing
+	// creation, rather than letting fs.Create (O_TRUNC) clobber it. Other modes
+	// keep the original truncating create.
+	var file billy.File
+	if how == createModeExclusive {
+		file, err = fs.OpenFile(newFilePath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+		if os.IsExist(err) {
+			return &NFSStatusError{NFSStatusExist, err}
+		}
+	} else {
+		file, err = fs.Create(newFilePath)
+	}
 	if err != nil {
 		Log.Errorf("Error Creating: %v", err)
 		return &NFSStatusError{NFSStatusAccess, err}
