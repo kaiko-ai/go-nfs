@@ -87,7 +87,10 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 
-	if err := userHandle.InvalidateHandle(fs, oldHandle); err != nil {
+	// Remap the source handle to the destination path instead of invalidating
+	// it: NFS file handles must survive renames (object_store holds the staging
+	// file's handle open across its staging->final rename, then fstats it).
+	if err := userHandle.UpdateHandle(fs, oldHandle, append(toPath, string(to.Filename))); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 

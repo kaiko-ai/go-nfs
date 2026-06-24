@@ -100,6 +100,20 @@ func (c *CachingHandler) FromHandle(fh []byte) (billy.Filesystem, []string, erro
 	return nil, []string{}, &nfs.NFSStatusError{NFSStatus: nfs.NFSStatusStale}
 }
 
+// UpdateHandle remaps an existing handle to a new path so it keeps resolving
+// after a rename (NFS file handles must survive renames).
+func (c *CachingHandler) UpdateHandle(f billy.Filesystem, handle []byte, newPath []string) error {
+	id, err := uuid.FromBytes(handle)
+	if err != nil {
+		return err
+	}
+	np := make([]string, len(newPath))
+	copy(np, newPath)
+	c.activeHandles.Add(id, entry{f, np})
+	c.appendReverseHandle(f.Join(np...), id)
+	return nil
+}
+
 func (c *CachingHandler) searchReverseCache(f billy.Filesystem, path string) []byte {
 	uuids := c.getReverseHandles(path)
 

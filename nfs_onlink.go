@@ -9,84 +9,77 @@ import (
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
-// Backing billy.FS doesn't support hard links
+// onLink implements the NFSv3 LINK RPC (hard link). RFC 1813 LINK3args is
+//
+//	struct LINK3args { nfs_fh3 file; diropargs3 link; }
+//
+// i.e. the handle of the existing file to link to, followed by the directory
+// handle + name where the new link is created. The backing filesystem must
+// implement UnixChange (hard links); SFTP exposes this via the
+// hardlink@openssh.com extension.
 func onLink(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = wccDataErrorFormatter
-	obj := DirOpArg{}
-	err := xdr.Read(w.req.Body, &obj)
+
+	fileHandle, err := xdr.ReadOpaque(w.req.Body)
 	if err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
-	attrs, err := ReadSetFileAttributes(w.req.Body)
-	if err != nil {
+	link := DirOpArg{}
+	if err := xdr.Read(w.req.Body, &link); err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 
-	target, err := xdr.ReadOpaque(w.req.Body)
-	if err != nil {
-		return &NFSStatusError{NFSStatusInval, err}
-	}
-
-	fs, path, err := userHandle.FromHandle(obj.Handle)
+	// Existing file to link to.
+	fs, filePath, err := userHandle.FromHandle(fileHandle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
-	if !billy.CapabilityCheck(fs, billy.WriteCapability) {
+	// Directory the new link is created in.
+	dirFS, dirPath, err := userHandle.FromHandle(link.Handle)
+	if err != nil {
+		return &NFSStatusError{NFSStatusStale, err}
+	}
+	if !billy.CapabilityCheck(dirFS, billy.WriteCapability) {
 		return &NFSStatusError{NFSStatusROFS, os.ErrPermission}
 	}
-
-	if len(string(obj.Filename)) > PathNameMax {
+	if len(string(link.Filename)) > PathNameMax {
 		return &NFSStatusError{NFSStatusNameTooLong, os.ErrInvalid}
 	}
 
-	newFilePath := fs.Join(append(path, string(obj.Filename))...)
-	if _, err := fs.Stat(newFilePath); err == nil {
+	existingPath := fs.Join(filePath...)
+	newFilePath := dirFS.Join(append(dirPath, string(link.Filename))...)
+	if _, err := dirFS.Stat(newFilePath); err == nil {
 		return &NFSStatusError{NFSStatusExist, os.ErrExist}
 	}
-	if s, err := fs.Stat(fs.Join(path...)); err != nil {
+	if s, err := dirFS.Stat(dirFS.Join(dirPath...)); err != nil {
 		return &NFSStatusError{NFSStatusAccess, err}
 	} else if !s.IsDir() {
 		return &NFSStatusError{NFSStatusNotDir, nil}
 	}
 
-	fp := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
-	changer := userHandle.Change(fs)
+	changer := userHandle.Change(dirFS)
 	if changer == nil {
-		return &NFSStatusError{NFSStatusAccess, err}
+		return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
 	}
 	cos, ok := changer.(UnixChange)
 	if !ok {
-		return &NFSStatusError{NFSStatusAccess, err}
+		return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
+	}
+	if err := cos.Link(existingPath, newFilePath); err != nil {
+		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 
-	err = cos.Link(string(target), newFilePath)
-	if err != nil {
-		return &NFSStatusError{NFSStatusAccess, err}
-	}
-	if err := attrs.Apply(changer, fs, newFilePath); err != nil {
-		return &NFSStatusError{NFSStatusIO, err}
-	}
-
+	// LINK3resok { post_op_attr file_attributes; wcc_data linkdir_wcc; }
 	writer := bytes.NewBuffer([]byte{})
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-
-	// "handle follows"
-	if err := xdr.Write(writer, uint32(1)); err != nil {
+	if err := WritePostOpAttrs(writer, tryStat(fs, filePath)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := xdr.Write(writer, fp); err != nil {
+	if err := WriteWcc(writer, nil, tryStat(dirFS, dirPath)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := WritePostOpAttrs(writer, tryStat(fs, append(path, string(obj.Filename)))); err != nil {
-		return &NFSStatusError{NFSStatusServerFault, err}
-	}
-
-	if err := WriteWcc(writer, nil, tryStat(fs, path)); err != nil {
-		return &NFSStatusError{NFSStatusServerFault, err}
-	}
-
 	if err := w.Write(writer.Bytes()); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
