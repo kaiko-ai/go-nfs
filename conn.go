@@ -40,6 +40,13 @@ const (
 type conn struct {
 	*Server
 	writeSerializer chan []byte
+	// inflight tracks XIDs currently being processed, so retransmitted requests
+	// (client timed out waiting on a queued reply) are dropped instead of
+	// re-executed. Without this, retransmits amplify load exactly when the
+	// server is already saturated. The original reply still reaches the client
+	// over the intact TCP connection.
+	inflightMu sync.Mutex
+	inflight   map[uint32]struct{}
 	net.Conn
 }
 
@@ -47,6 +54,7 @@ func (c *conn) serve(ctx context.Context) {
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	c.writeSerializer = make(chan []byte, 1)
+	c.inflight = make(map[uint32]struct{})
 	go c.serializeWrites(connCtx)
 
 	maxInflight := c.Server.MaxInflightRequests
@@ -78,13 +86,26 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 		Log.Tracef("request: %v", w.req)
+		c.inflightMu.Lock()
+		if _, dup := c.inflight[w.req.xid]; dup {
+			c.inflightMu.Unlock()
+			Log.Tracef("dropping retransmitted request: %v", w.req)
+			continue
+		}
+		c.inflight[w.req.xid] = struct{}{}
+		c.inflightMu.Unlock()
 		select {
 		case sem <- struct{}{}:
 		case <-connCtx.Done():
 			return
 		}
 		go func(w *response) {
-			defer func() { <-sem }()
+			defer func() {
+				c.inflightMu.Lock()
+				delete(c.inflight, w.req.xid)
+				c.inflightMu.Unlock()
+				<-sem
+			}()
 			err := c.handle(connCtx, w)
 			respErr := w.finish(connCtx)
 			if err != nil {
