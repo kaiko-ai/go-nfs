@@ -14,6 +14,12 @@ type Server struct {
 	Handler
 	ID [8]byte
 	context.Context
+	// MaxInflightRequests caps how many requests are processed concurrently per
+	// connection. Values below 2 preserve the historical serial behavior: one
+	// request is read, handled, and answered before the next is read. Higher
+	// values let independent requests overlap their backing-store round trips;
+	// replies are matched by RPC XID, so out-of-order completion is safe.
+	MaxInflightRequests int
 }
 
 // RegisterMessageHandler registers a handler for a specific
