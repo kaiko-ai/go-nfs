@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 
 	xdr2 "github.com/rasky/go-xdr/xdr2"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
@@ -48,31 +49,55 @@ func (c *conn) serve(ctx context.Context) {
 	c.writeSerializer = make(chan []byte, 1)
 	go c.serializeWrites(connCtx)
 
+	maxInflight := c.Server.MaxInflightRequests
+	if maxInflight < 1 {
+		maxInflight = 1
+	}
+	// Request frames are fully buffered before dispatch (see readRequestHeader),
+	// so handlers never touch the connection's read stream and independent
+	// requests can be processed concurrently. Replies carry the request XID and
+	// funnel through writeSerializer, so out-of-order completion is safe.
+	sem := make(chan struct{}, maxInflight)
+	var closeOnce sync.Once
+	fail := func() {
+		closeOnce.Do(func() {
+			c.Close()
+			cancel()
+		})
+	}
+
 	bio := bufio.NewReader(c.Conn)
 	for {
 		w, err := c.readRequestHeader(connCtx, bio)
 		if err != nil {
 			if err == io.EOF {
 				// Clean close.
-				c.Close()
+				fail()
 				return
 			}
 			return
 		}
 		Log.Tracef("request: %v", w.req)
-		err = c.handle(connCtx, w)
-		respErr := w.finish(connCtx)
-		if err != nil {
-			Log.Errorf("error handling req: %v", err)
-			// failure to handle at a level needing to close the connection.
-			c.Close()
+		select {
+		case sem <- struct{}{}:
+		case <-connCtx.Done():
 			return
 		}
-		if respErr != nil {
-			Log.Errorf("error sending response: %v", respErr)
-			c.Close()
-			return
-		}
+		go func(w *response) {
+			defer func() { <-sem }()
+			err := c.handle(connCtx, w)
+			respErr := w.finish(connCtx)
+			if err != nil {
+				Log.Errorf("error handling req: %v", err)
+				// failure to handle at a level needing to close the connection.
+				fail()
+				return
+			}
+			if respErr != nil {
+				Log.Errorf("error sending response: %v", respErr)
+				fail()
+			}
+		}(w)
 	}
 }
 
@@ -294,7 +319,14 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		return nil, ErrInputInvalid
 	}
 
-	r := io.LimitedReader{R: reader, N: int64(reqLen)}
+	// Read the whole frame off the connection before returning: the handler may
+	// run concurrently with the next frame being read, so it must never touch
+	// the connection's stream. Bounded by the client's negotiated wsize.
+	frame := make([]byte, reqLen)
+	if _, err := io.ReadFull(reader, frame); err != nil {
+		return nil, err
+	}
+	r := io.LimitedReader{R: bytes.NewReader(frame), N: int64(reqLen)}
 
 	xid, err := xdr.ReadUint32(&r)
 	if err != nil {
