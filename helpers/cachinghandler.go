@@ -85,17 +85,20 @@ func (c *CachingHandler) FromHandle(fh []byte) (billy.Filesystem, []string, erro
 	}
 
 	if f, ok := c.activeHandles.Get(id); ok {
-		for _, k := range c.activeHandles.Keys() {
-			candidate, _ := c.activeHandles.Peek(k)
-			if hasPrefix(f.p, candidate.p) {
-				_, _ = c.activeHandles.Get(k)
+		// Keep this handle's ancestor directory handles warm so an active
+		// child can't outlive its parent in the LRU (ESTALE on the parent).
+		// Walk the O(depth) ancestors via the reverse map instead of scanning
+		// the whole handle cache: the previous Keys() scan was O(N) per call,
+		// which made a READDIRPLUS walk of an N-entry directory O(N^2) and
+		// allocated an N-sized slice on every RPC.
+		for i := len(f.p) - 1; i >= 0; i-- {
+			for _, aid := range c.getReverseHandles(f.f.Join(f.p[:i]...)) {
+				_, _ = c.activeHandles.Get(aid)
 			}
 		}
-		if ok {
-			newP := make([]string, len(f.p))
-			copy(newP, f.p)
-			return f.f, newP, nil
-		}
+		newP := make([]string, len(f.p))
+		copy(newP, f.p)
+		return f.f, newP, nil
 	}
 	return nil, []string{}, &nfs.NFSStatusError{NFSStatus: nfs.NFSStatusStale}
 }
